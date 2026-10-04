@@ -7,6 +7,7 @@
   "scripts": {
     "check": "node scripts/check.mjs",
     "deploy": "node scripts/deploy.mjs",
+    "markets": "node scripts/open-markets.mjs",
     "schema": "node scripts/schema.mjs",
     "test": "pytest"
   },
