@@ -1,0 +1,187 @@
+// A client, an account, the fee flow, and the deployment record.
+//
+// The stable Studionet SDK uses the five-argument addTransaction selector and
+// does not expose the preview fee estimator. The v2 preview SDK estimates the
+// policy for each write and submits its distribution and fee value.
+//
+// Settlement is `waitForFinalization` plus `isSuccessful`: a transaction can
+// finalize by consensus and still have reverted in execution, and those are
+// two different questions.
+
+import { readFile, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import {
+  DEFAULT_FEES_DISTRIBUTION,
+  createAccount as createPreviewAccount,
+  createClient as createPreviewClient,
+  isSuccessful,
+} from "genlayer-js";
+import {
+  createAccount as createStableAccount,
+  createClient as createStableClient,
+} from "genlayer-js-stable";
+
+import { resolveTarget } from "./chain.mjs";
+
+export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+export const CONTRACT_PATH = resolve(ROOT, "contracts/epip.py");
+export const RECORD_PATH = resolve(ROOT, ".epip-deploy.json");
+
+export async function contractSource() {
+  return readFile(CONTRACT_PATH, "utf8");
+}
+
+/** The signer must be supplied by the deployer for this session. */
+export function account(stable = true) {
+  const given = process.env.EPIP_PRIVATE_KEY;
+  if (!given || !/^0x[0-9a-fA-F]{64}$/.test(given)) {
+    throw new Error("EPIP_PRIVATE_KEY must be a 0x-prefixed 32-byte hex key in the process environment");
+  }
+  return stable ? createStableAccount(given) : createPreviewAccount(given);
+}
+
+export async function connect() {
+  const { target, fellBack, insteadOf } = await resolveTarget();
+  if (fellBack) {
+    console.log(`! ${insteadOf.name} did not answer; using ${target.name}`);
+  }
+  const stable = target.id === 61999;
+  const signer = account(stable);
+  // `endpoint` as well as the chain's own rpcUrls: the SDK ships a URL per
+  // named chain, and if that ever diverges from the one being advertised the
+  // client would quietly read and write against a different node.
+  const client = (stable ? createStableClient : createPreviewClient)({
+    chain: target.chain,
+    endpoint: target.rpc,
+    account: signer,
+  });
+  console.log(`- ${target.name} (chain ${target.id}) at ${target.rpc}`);
+  console.log(`- signing as ${signer.address}`);
+  return { client, target, account: signer };
+}
+
+/**
+ * Wait for finalization, then say plainly whether the execution succeeded.
+ *
+ * Consensus finalizing and the contract not reverting are separate facts, and
+ * a script that conflates them reports a refused call as a successful one.
+ */
+export async function settle(client, hash, label) {
+  const transaction = client.waitForFinalization
+    ? await client.waitForFinalization({ hash, fullTransaction: true, retries: 120 })
+    : await client.waitForTransactionReceipt({ hash, status: "FINALIZED", fullTransaction: true, retries: 120 });
+  const status = transaction.statusName ?? transaction.status_name ?? "unknown";
+  const consensus = transaction.resultName ?? transaction.result_name ?? "unknown";
+  const receipts = transaction.consensus_data?.leader_receipt;
+  const leader = Array.isArray(receipts) ? receipts[0] : receipts;
+  const execution = transaction.txExecutionResultName ?? leader?.execution_result ?? "unknown";
+
+  // The current Studio RPC returns a legacy receipt without
+  // txExecutionResultName. Its leader receipt reports SUCCESS and a return
+  // status when execution finished normally; consensus must also agree.
+  const studioSuccess =
+    status === "FINALIZED" &&
+    consensus === "MAJORITY_AGREE" &&
+    leader?.execution_result === "SUCCESS" &&
+    leader?.result?.status === "return";
+
+  if (!isSuccessful(transaction) && !studioSuccess) {
+    const refusal = refusalIn(transaction);
+    throw new Error(
+      `${label} ${hash} did not succeed: ${status} / ${consensus} / ${execution}` +
+        (refusal ? `\n    ${refusal}` : ""),
+    );
+  }
+  console.log(`  ${label}: ${status} / ${consensus} / ${execution}`);
+  return transaction;
+}
+
+/**
+ * EPIP's own refusals read as `epip/<code>: <what is missing>`. Dig one
+ * out of a receipt so a failed call says why rather than just that it failed.
+ */
+export function refusalIn(transaction) {
+  const text = JSON.stringify(transaction ?? {}, (_, value) =>
+    typeof value === "bigint" ? value.toString() : value,
+  );
+  const found = text.match(/epip\\?\/[a-z-]+:(?:\\.|[^"\\])*/);
+  return found ? found[0].replace(/\\"/g, '"').replace(/\\\//g, "/").trim() : "";
+}
+
+/**
+ * One write, with its fees estimated first. R-MON aside, this is the only
+ * place fees are decided, so every script charges the same way.
+ *
+ * The estimate is a simulation of the concrete call, so it also fails early
+ * and loudly on a call the contract would refuse -- before anything is sent.
+ */
+export async function write(client, call, label) {
+  if (!client.estimateTransactionFeesForWrite) {
+    const hash = await client.writeContract(call);
+    console.log(`  ${label}: ${hash}`);
+    return settle(client, hash, label);
+  }
+
+  let fees;
+  try {
+    const estimate = await client.estimateTransactionFeesForWrite(call);
+    fees = {
+      distribution: estimate.distribution,
+      feeValue: estimate.feeValue,
+      ...(estimate.messageAllocations
+        ? { messageAllocations: estimate.messageAllocations }
+        : {}),
+    };
+    if (estimate.policy && estimate.policy.enabled === false) {
+      console.log(`  ${label}: gasless deployment, no fee deposit`);
+    }
+  } catch (error) {
+    // A deployment that does not charge fees has nothing to estimate. Carry
+    // on without a deposit rather than refusing to write at all.
+    console.log(`  ${label}: no fee estimate (${short(error)}); submitting without one`);
+    fees = undefined;
+  }
+
+  const hash = await client.writeContract({ ...call, ...(fees ? { fees } : {}) });
+  console.log(`  ${label}: ${hash}`);
+  return settle(client, hash, label);
+}
+
+/** Use the stable Studionet deploy format, or the preview fee distribution. */
+export async function deploy(client, code, args = []) {
+  const hash = await client.deployContract({
+    code,
+    args,
+    ...(client.waitForFinalization
+      ? { fees: { distribution: DEFAULT_FEES_DISTRIBUTION } }
+      : {}),
+  });
+  console.log(`- deploy transaction ${hash}`);
+  return { hash, transaction: await settle(client, hash, "deploy") };
+}
+
+export function short(error) {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.split("\n")[0].slice(0, 160);
+}
+
+export async function readRecord() {
+  const given = process.env.EPIP_CONTRACT;
+  if (given) return { address: given, source: "EPIP_CONTRACT" };
+  try {
+    const held = JSON.parse(await readFile(RECORD_PATH, "utf8"));
+    return { ...held, source: RECORD_PATH };
+  } catch {
+    throw new Error(
+      "no deployment found. Run `npm run deploy`, or set EPIP_CONTRACT to " +
+        "an address already on the network.",
+    );
+  }
+}
+
+export async function writeRecord(record) {
+  await writeFile(RECORD_PATH, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  console.log(`- wrote ${RECORD_PATH}`);
+}
