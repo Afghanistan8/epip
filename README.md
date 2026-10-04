@@ -69,6 +69,13 @@ Read the deployed schema back from the chain with:
 npm run schema
 ```
 
+## Live deployment
+
+EPIP is deployed on GenLayer Studionet at
+[`0xc3015f1b4c2Ffa55Df84d0F3b396bAb8Ed7a29ec`](https://explorer-studio.genlayer.com/address/0xc3015f1b4c2Ffa55Df84d0F3b396bAb8Ed7a29ec).
+The network uses chain `61999` and RPC `https://studio.genlayer.com/api`.
+See [docs/deployment.md](docs/deployment.md) for the deployment transaction and verification result.
+
 ## Repository layout
 
 - `contracts/epip.py` — the standalone intelligent contract
